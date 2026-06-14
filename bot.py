@@ -110,7 +110,24 @@ WELCOME_TEXT = (
     "🎨 Аниме · 🔄 Сменить ракурс · 💡 Убрать тени · 🌅 Пересвет · "
     "🔦 Направленный свет · 🧑 Детали кожи · 🎬 Следующая сцена · "
     "🎞 Flat/Log цвет · ⬆️ Апскейл · 🖼 Апскейл 2K · ⚫ Точечная иллюстрация.\n\n"
-    "Команды: /start, /help — это сообщение."
+    "Команды: /start, /help — это сообщение · /limits — лимиты GPU."
+)
+
+# Текст про лимиты ZeroGPU. Бот авторизуется в Space как PRO-аккаунт, поэтому
+# и показываем PRO-тариф. Живой остаток в секундах HF наружу по API не отдаёт —
+# поэтому даём факты по тарифу + ссылку на страницу с живым индикатором.
+LIMITS_TEXT = (
+    "📊 Лимиты ZeroGPU\n\n"
+    "Лимит считается во времени GPU в день на аккаунт (общий пул на все "
+    "ZeroGPU-Space), а не в числе запросов. Бот ходит в Space как PRO-аккаунт:\n\n"
+    "• Тариф PRO → 40 мин GPU в день, наивысший приоритет в очереди.\n"
+    "• Этот Space = xlarge (полная RTX Pro 6000 Blackwell, 96 ГБ) → расход ×2, "
+    "то есть ~20 мин реальной генерации в день.\n"
+    "• Сброс: через 24 ч после первого использования (скользящее окно).\n"
+    "• Сверх лимита (PRO): доплата $1 за 10 мин GPU из кредитов.\n\n"
+    "Живой остаток квоты — на странице Space (индикатор вверху) и в биллинге:\n"
+    "https://huggingface.co/spaces/productowner/Qwen-Image-Edit-2509-LoRAs-Fast-v2\n"
+    "https://huggingface.co/settings/billing"
 )
 
 
@@ -118,6 +135,15 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await _guard(update, context):
         return
     await update.effective_message.reply_text(WELCOME_TEXT)
+
+
+async def cmd_limits(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/limits — показать лимиты ZeroGPU."""
+    if not await _guard(update, context):
+        return
+    await update.effective_message.reply_text(
+        LIMITS_TEXT, disable_web_page_preview=True
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -348,6 +374,11 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if data == "newphoto":
         store.reset(user_id)
         await _show(query, "Пришли новое фото 📷")
+        return
+
+    # --- Лимиты GPU ---------------------------------------------------- #
+    if data == "limits":
+        await _show(query, LIMITS_TEXT, reply_markup=main_menu())
         return
 
     # Неизвестный callback — молча игнорируем (уже ответили на query).
@@ -618,6 +649,7 @@ def main() -> None:
 
     # Команды.
     application.add_handler(CommandHandler(["start", "help"], cmd_start))
+    application.add_handler(CommandHandler("limits", cmd_limits))
 
     # Фото и картинки-документы.
     application.add_handler(

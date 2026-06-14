@@ -51,9 +51,6 @@ class SpaceClient:
     """
 
     def __init__(self, space_id: str, hf_token: str | None = None, timeout: int = 300) -> None:
-        # hf_token принимаем в сигнатуре ради совместимости контракта,
-        # но в gradio_client.Client его НЕ передаём: Space публичный, а
-        # некоторые версии клиента отвергают kwarg hf_token.
         self.space_id = space_id
         self.hf_token = hf_token
         self.timeout = timeout
@@ -62,8 +59,28 @@ class SpaceClient:
     # --- управление клиентом ------------------------------------------------
 
     def _build_client(self) -> Client:
-        """Создать новый gradio_client.Client (без hf_token)."""
-        logger.info("Создаю gradio_client.Client для Space %s", self.space_id)
+        """Создать новый gradio_client.Client.
+
+        Если задан hf_token — передаём его, чтобы запросы шли от имени нашего
+        HF-аккаунта и расходовали его PRO-квоту ZeroGPU (40 мин/день), а не
+        анонимный тариф (~2 мин/день). На старых версиях gradio_client, где
+        kwarg hf_token/headers отсутствует, аккуратно откатываемся на аноним.
+        """
+        if self.hf_token:
+            try:
+                logger.info("Создаю gradio_client.Client (auth) для Space %s", self.space_id)
+                return Client(self.space_id, hf_token=self.hf_token)
+            except TypeError:
+                try:
+                    return Client(
+                        self.space_id,
+                        headers={"Authorization": f"Bearer {self.hf_token}"},
+                    )
+                except TypeError:
+                    logger.warning(
+                        "gradio_client не принимает hf_token/headers — иду анонимно"
+                    )
+        logger.info("Создаю gradio_client.Client (anon) для Space %s", self.space_id)
         return Client(self.space_id)
 
     def _get_client(self) -> Client:

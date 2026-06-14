@@ -14,6 +14,7 @@
     again              — повторить (с новым случайным seed)
     newphoto           — сбросить, попросить новое фото
     menu               — показать меню фич
+    limits             — показать лимиты ZeroGPU
 
 Никаких побочных эффектов на импорте — только определения функций.
 """
@@ -42,6 +43,10 @@ def main_menu() -> InlineKeyboardMarkup:
     rows.append([
         InlineKeyboardButton("⚙️ Настройки", callback_data="set"),
         InlineKeyboardButton("✨ Сгенерировать", callback_data="gen"),
+    ])
+    # Просмотр лимитов ZeroGPU.
+    rows.append([
+        InlineKeyboardButton("📊 GPU-лимиты", callback_data="limits"),
     ])
 
     return InlineKeyboardMarkup(rows)
