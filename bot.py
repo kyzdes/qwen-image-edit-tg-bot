@@ -599,12 +599,19 @@ async def run_generation(
     session.settings.seed = int(used_seed)
     session.settings.randomize_seed = False
 
+    # Telegram ограничивает подпись 1024 символами — длинный кастомный prompt
+    # обрезаем, плюс жёсткий потолок на всю подпись как страховка.
+    prompt_disp = session.prompt.strip()
+    if len(prompt_disp) > 700:
+        prompt_disp = prompt_disp[:700] + "…"
     caption = (
         f"{feature.label}\n"
-        f"{session.prompt.strip()}\n"
+        f"{prompt_disp}\n"
         f"seed: {used_seed}\n"
         f"steps: {settings.steps}, cfg: {settings.guidance}"
     )
+    if len(caption) > 1024:
+        caption = caption[:1023] + "…"
 
     # Убираем статусное сообщение (best-effort) и отправляем результат.
     await _safe_delete(status)
