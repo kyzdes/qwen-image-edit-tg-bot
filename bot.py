@@ -564,14 +564,21 @@ async def run_generation(
         logger.warning("ZeroGPU quota exceeded", exc_info=True)
         # Кэшируем точные цифры HF (единственный момент, когда они известны).
         usage.tracker.record_quota_error(exc.remaining_seconds, exc.retry_seconds)
-        parts = ["⚠️ Лимит ZeroGPU исчерпан."]
-        if exc.remaining_seconds is not None:
-            parts.append(f"Осталось ~{int(exc.remaining_seconds)} c GPU.")
+        rem = exc.remaining_seconds
+        if rem is not None and rem > 0:
+            # Важно: это НЕ «исчерпана». Остаток есть (~rem c), но его не хватает,
+            # чтобы зарезервировать GPU-слот под задачу (xlarge резервирует больше).
+            parts = [
+                f"⚠️ Сейчас не запустить: осталось ~{int(rem)} c квоты ZeroGPU, "
+                f"а задаче нужно зарезервировать больше (xlarge ×2)."
+            ]
+        else:
+            parts = ["⚠️ Дневная квота ZeroGPU исчерпана."]
         if exc.retry_seconds:
-            parts.append(f"Сброс через ~{_fmt_dur(exc.retry_seconds)}.")
-        if exc.remaining_seconds is None and not exc.retry_seconds:
-            parts.append("Сбрасывается через ~24ч после первого использования.")
-        parts.append("Подробнее — кнопка 📊 GPU-лимиты.")
+            parts.append(f"Сброс примерно через {_fmt_dur(exc.retry_seconds)}.")
+        else:
+            parts.append("Сбрасывается в течение 24ч после первого использования.")
+        parts.append("Остаток и детали — кнопка 📊 GPU-лимиты.")
         await _safe_edit(status, " ".join(parts))
         return
     except SpaceError as exc:
