@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import logging
+import re
 
 from gradio_client import Client
 
@@ -31,13 +32,62 @@ class SpaceError(Exception):
 
 
 class QuotaExceeded(SpaceError):
-    """Исчерпана дневная квота ZeroGPU на стороне Space."""
+    """Исчерпана дневная квота ZeroGPU на стороне Space.
+
+    remaining_seconds / retry_seconds — точные цифры из текста ошибки HF
+    («... X left. Retry in Y»), если их удалось распарсить, иначе None.
+    Это единственный момент, когда HF сообщает реальный остаток квоты.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        remaining_seconds: float | None = None,
+        retry_seconds: float | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.remaining_seconds = remaining_seconds
+        self.retry_seconds = retry_seconds
 
 
 def _looks_like_quota_error(message: str) -> bool:
     """True, если текст ошибки похож на ошибку квоты ZeroGPU."""
     low = message.lower()
     return any(marker in low for marker in _QUOTA_MARKERS)
+
+
+# Парсинг точных чисел из текста ошибки квоты ZeroGPU.
+_RE_LEFT = re.compile(r"(\d+(?:\.\d+)?)\s*s(?:econds)?\s*left", re.IGNORECASE)
+_RE_VS = re.compile(r"vs\.?\s*(\d+(?:\.\d+)?)", re.IGNORECASE)
+_RE_RETRY_HMS = re.compile(r"retry in\s*(\d{1,2}:\d{2}(?::\d{2})?)", re.IGNORECASE)
+_RE_RETRY_S = re.compile(r"retry in\s*(\d+(?:\.\d+)?)\s*s", re.IGNORECASE)
+
+
+def _parse_quota_numbers(message: str) -> tuple[float | None, float | None]:
+    """Достать (remaining_seconds, retry_seconds) из текста ошибки квоты."""
+    remaining: float | None = None
+    m = _RE_LEFT.search(message) or _RE_VS.search(message)
+    if m:
+        try:
+            remaining = float(m.group(1))
+        except ValueError:
+            remaining = None
+
+    retry: float | None = None
+    mh = _RE_RETRY_HMS.search(message)
+    if mh:
+        secs = 0
+        for part in mh.group(1).split(":"):
+            secs = secs * 60 + int(part)
+        retry = float(secs)
+    else:
+        ms = _RE_RETRY_S.search(message)
+        if ms:
+            try:
+                retry = float(ms.group(1))
+            except ValueError:
+                retry = None
+    return remaining, retry
 
 
 class SpaceClient:
@@ -67,19 +117,26 @@ class SpaceClient:
         kwarg hf_token/headers отсутствует, аккуратно откатываемся на аноним.
         """
         if self.hf_token:
-            try:
-                logger.info("Создаю gradio_client.Client (auth) для Space %s", self.space_id)
-                return Client(self.space_id, hf_token=self.hf_token)
-            except TypeError:
+            # У gradio_client менялось имя параметра авторизации: сейчас это
+            # token= (>=1.x), раньше hf_token=, на совсем старых — только
+            # заголовок. Пробуем по очереди; любой успех = ходим от имени
+            # владельца токена → расход по его PRO-квоте ZeroGPU (40 мин/день),
+            # а не по анонимному тарифу (~2 мин/день).
+            for kwargs in (
+                {"token": self.hf_token},
+                {"hf_token": self.hf_token},
+                {"headers": {"Authorization": f"Bearer {self.hf_token}"}},
+            ):
                 try:
-                    return Client(
+                    logger.info(
+                        "Создаю gradio_client.Client (auth via %s) для Space %s",
+                        next(iter(kwargs)),
                         self.space_id,
-                        headers={"Authorization": f"Bearer {self.hf_token}"},
                     )
+                    return Client(self.space_id, **kwargs)
                 except TypeError:
-                    logger.warning(
-                        "gradio_client не принимает hf_token/headers — иду анонимно"
-                    )
+                    continue
+            logger.warning("gradio_client не принял авторизацию — иду анонимно")
         logger.info("Создаю gradio_client.Client (anon) для Space %s", self.space_id)
         return Client(self.space_id)
 
@@ -169,7 +226,8 @@ class SpaceClient:
             # Ошибки квоты не лечатся ретраем — сразу пробрасываем.
             if _looks_like_quota_error(message):
                 logger.warning("Квота ZeroGPU исчерпана: %s", message)
-                raise QuotaExceeded(message) from exc
+                rem, retry = _parse_quota_numbers(message)
+                raise QuotaExceeded(message, rem, retry) from exc
 
             # Похоже на проблему соединения — пересоздаём клиент и пробуем ещё раз.
             if self._is_connection_error(exc):
@@ -186,7 +244,8 @@ class SpaceClient:
                     message2 = str(exc2) or exc2.__class__.__name__
                     if _looks_like_quota_error(message2):
                         logger.warning("Квота ZeroGPU исчерпана: %s", message2)
-                        raise QuotaExceeded(message2) from exc2
+                        rem2, retry2 = _parse_quota_numbers(message2)
+                        raise QuotaExceeded(message2, rem2, retry2) from exc2
                     logger.error("Повторный вызов Space не удался: %s", message2)
                     raise SpaceError(message2) from exc2
 

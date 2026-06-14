@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import logging
+import time
 from io import BytesIO
 
 from telegram import (
@@ -41,6 +42,7 @@ from keyboards import (
 )
 from space_client import QuotaExceeded, SpaceClient, SpaceError
 from state import store
+import usage
 
 logger = logging.getLogger(__name__)
 
@@ -113,22 +115,72 @@ WELCOME_TEXT = (
     "Команды: /start, /help — это сообщение · /limits — лимиты GPU."
 )
 
-# Текст про лимиты ZeroGPU. Бот авторизуется в Space как PRO-аккаунт, поэтому
-# и показываем PRO-тариф. Живой остаток в секундах HF наружу по API не отдаёт —
-# поэтому даём факты по тарифу + ссылку на страницу с живым индикатором.
-LIMITS_TEXT = (
-    "📊 Лимиты ZeroGPU\n\n"
-    "Лимит считается во времени GPU в день на аккаунт (общий пул на все "
-    "ZeroGPU-Space), а не в числе запросов. Бот ходит в Space как PRO-аккаунт:\n\n"
-    "• Тариф PRO → 40 мин GPU в день, наивысший приоритет в очереди.\n"
-    "• Этот Space = xlarge (полная RTX Pro 6000 Blackwell, 96 ГБ) → расход ×2, "
-    "то есть ~20 мин реальной генерации в день.\n"
-    "• Сброс: через 24 ч после первого использования (скользящее окно).\n"
-    "• Сверх лимита (PRO): доплата $1 за 10 мин GPU из кредитов.\n\n"
-    "Живой остаток квоты — на странице Space (индикатор вверху) и в биллинге:\n"
-    "https://huggingface.co/spaces/productowner/Qwen-Image-Edit-2509-LoRAs-Fast-v2\n"
-    "https://huggingface.co/settings/billing"
+SPACE_PAGE_URL = (
+    "https://huggingface.co/spaces/productowner/Qwen-Image-Edit-2509-LoRAs-Fast-v2"
 )
+
+
+def _fmt_dur(seconds: float | None) -> str:
+    """Человекочитаемая длительность: '2ч 5м' / '7м 30с' / '45с'."""
+    if seconds is None:
+        return "?"
+    s = int(seconds)
+    h, rem = divmod(s, 3600)
+    m, sec = divmod(rem, 60)
+    if h:
+        return f"{h}ч {m}м"
+    if m:
+        return f"{m}м {sec}с"
+    return f"{sec}с"
+
+
+def build_limits_text() -> str:
+    """Динамический текст лимитов: реальный расход бота + точные данные HF.
+
+    HF не отдаёт остаток квоты по API, поэтому показываем то, что реально
+    знаем: собственный учёт расхода за окно и (если был) точный остаток из
+    последней ошибки квоты HF.
+    """
+    t = usage.tracker
+    lines: list[str] = ["📊 Лимиты ZeroGPU", ""]
+
+    # Реальный расход самого бота за текущее окно.
+    if t.window_start is None:
+        lines.append("За текущее окно бот ещё не генерировал.")
+    else:
+        lines.append(
+            f"За текущее 24-ч окно бот сделал генераций: {t.generations} "
+            f"(≈{t.est_gpu_seconds / 60:.1f} мин GPU — грубая оценка)."
+        )
+        lines.append(f"Окно сбросится через ~{_fmt_dur(t.reset_in_seconds())}.")
+
+    # Точные данные HF — только когда была ошибка квоты.
+    if t.last_quota and t.last_quota.remaining_seconds is not None:
+        extra = (
+            f", сброс через ~{_fmt_dur(t.last_quota.retry_seconds)}"
+            if t.last_quota.retry_seconds
+            else ""
+        )
+        lines += [
+            "",
+            f"📡 Точные данные HF (на момент последней ошибки квоты): "
+            f"осталось ~{int(t.last_quota.remaining_seconds)} c GPU{extra}.",
+        ]
+
+    # Модель тарифа + честная оговорка.
+    lines += [
+        "",
+        "Как устроено:",
+        "• PRO → 40 мин GPU/день, наивысший приоритет.",
+        "• Этот Space = xlarge → расход ×2 (~20 мин реальной генерации/день).",
+        "• Сброс: 24 ч после первого использования; овердрафт $1/10 мин.",
+        "",
+        "⚠️ Точный остаток в реальном времени HF по API не отдаёт — бот считает "
+        "свой расход сам, а абсолютно точная цифра приходит лишь в момент "
+        "исчерпания. Живой индикатор — на странице Space:",
+        SPACE_PAGE_URL,
+    ]
+    return "\n".join(lines)
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -142,7 +194,7 @@ async def cmd_limits(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if not await _guard(update, context):
         return
     await update.effective_message.reply_text(
-        LIMITS_TEXT, disable_web_page_preview=True
+        build_limits_text(), disable_web_page_preview=True
     )
 
 
@@ -378,7 +430,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     # --- Лимиты GPU ---------------------------------------------------- #
     if data == "limits":
-        await _show(query, LIMITS_TEXT, reply_markup=main_menu())
+        await _show(query, build_limits_text(), reply_markup=main_menu())
         return
 
     # Неизвестный callback — молча игнорируем (уже ответили на query).
@@ -496,6 +548,7 @@ async def run_generation(
     space = _get_space(context)
     config = _get_config(context)
 
+    _t0 = time.monotonic()
     try:
         png_bytes, used_seed = await asyncio.to_thread(
             space.generate,
@@ -507,13 +560,19 @@ async def run_generation(
             settings.guidance,
             settings.steps,
         )
-    except QuotaExceeded:
+    except QuotaExceeded as exc:
         logger.warning("ZeroGPU quota exceeded", exc_info=True)
-        await _safe_edit(
-            status,
-            "⚠️ Лимит ZeroGPU на сегодня исчерпан. "
-            "Квота сбрасывается через ~24ч после первого использования.",
-        )
+        # Кэшируем точные цифры HF (единственный момент, когда они известны).
+        usage.tracker.record_quota_error(exc.remaining_seconds, exc.retry_seconds)
+        parts = ["⚠️ Лимит ZeroGPU исчерпан."]
+        if exc.remaining_seconds is not None:
+            parts.append(f"Осталось ~{int(exc.remaining_seconds)} c GPU.")
+        if exc.retry_seconds:
+            parts.append(f"Сброс через ~{_fmt_dur(exc.retry_seconds)}.")
+        if exc.remaining_seconds is None and not exc.retry_seconds:
+            parts.append("Сбрасывается через ~24ч после первого использования.")
+        parts.append("Подробнее — кнопка 📊 GPU-лимиты.")
+        await _safe_edit(status, " ".join(parts))
         return
     except SpaceError as exc:
         logger.exception("SpaceError при генерации")
@@ -531,6 +590,9 @@ async def run_generation(
             "Попробуй ещё раз (🔄) или другое фото.",
         )
         return
+
+    # Учёт расхода (для кнопки 📊 GPU-лимиты).
+    usage.tracker.record_generation(time.monotonic() - _t0)
 
     # Сохраняем использованный seed, выключаем рандом — чтобы «Повторить»
     # мог переиспользовать или, при нажатии again, заново заролить.
