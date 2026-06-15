@@ -142,44 +142,28 @@ def build_limits_text() -> str:
     последней ошибки квоты HF.
     """
     t = usage.tracker
-    lines: list[str] = ["📊 Лимиты ZeroGPU", ""]
+    lines: list[str] = ["📊 GPU-лимиты ZeroGPU", ""]
 
-    # Реальный расход самого бота за текущее окно.
-    if t.window_start is None:
-        lines.append("За текущее окно бот ещё не генерировал.")
+    lq = t.last_quota
+    if lq is not None and lq.retry_seconds:
+        left = (lq.at + lq.retry_seconds) - time.time()
+        if left > 0:
+            lines.append(f"⏳ Сброс лимита: через ~{_fmt_dur(left)}")
+            if lq.remaining_seconds is not None:
+                lines.append(f"Свободно сейчас: ~{int(lq.remaining_seconds)} с GPU")
+            lines.append(f"(по данным HF, {_fmt_dur(time.time() - lq.at)} назад)")
+        else:
+            lines.append("✅ Лимит уже должен был сброситься — можно генерировать.")
+    elif lq is not None and lq.remaining_seconds is not None:
+        lines.append(f"Свободно: ~{int(lq.remaining_seconds)} с GPU")
+        lines.append("Время до сброса HF в этот раз не сообщил.")
     else:
-        lines.append(
-            f"За текущее 24-ч окно бот сделал генераций: {t.generations} "
-            f"(≈{t.est_gpu_seconds / 60:.1f} мин GPU — грубая оценка)."
-        )
-        lines.append(f"Окно сбросится через ~{_fmt_dur(t.reset_in_seconds())}.")
+        if t.window_start is not None:
+            lines.append(f"⏳ Сброс окна бота: через ~{_fmt_dur(t.reset_in_seconds())}")
+        lines.append("Точные цифры появятся, когда упрёшься в лимит.")
 
-    # Точные данные HF — только когда была ошибка квоты.
-    if t.last_quota and t.last_quota.remaining_seconds is not None:
-        extra = (
-            f", сброс через ~{_fmt_dur(t.last_quota.retry_seconds)}"
-            if t.last_quota.retry_seconds
-            else ""
-        )
-        lines += [
-            "",
-            f"📡 Точные данные HF (на момент последней ошибки квоты): "
-            f"осталось ~{int(t.last_quota.remaining_seconds)} c GPU{extra}.",
-        ]
-
-    # Модель тарифа + честная оговорка.
-    lines += [
-        "",
-        "Как устроено:",
-        "• PRO → 40 мин GPU/день, наивысший приоритет.",
-        "• Этот Space = xlarge → расход ×2 (~20 мин реальной генерации/день).",
-        "• Сброс: 24 ч после первого использования; овердрафт $1/10 мин.",
-        "",
-        "⚠️ Точный остаток в реальном времени HF по API не отдаёт — бот считает "
-        "свой расход сам, а абсолютно точная цифра приходит лишь в момент "
-        "исчерпания. Живой индикатор — на странице Space:",
-        SPACE_PAGE_URL,
-    ]
+    lines.append("")
+    lines.append(f"Сделано ботом за сутки: {t.generations} генераций")
     return "\n".join(lines)
 
 
