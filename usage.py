@@ -53,6 +53,11 @@ class UsageTracker:
     def record_quota_error(
         self, remaining_seconds: float | None, retry_seconds: float | None
     ) -> None:
+        # Ошибка квоты — тоже активность: если окно ещё не открыто, открываем,
+        # чтобы оценка сброса (window_start + 24ч) работала даже без успешных
+        # генераций в этой сессии.
+        if self.window_start is None:
+            self.window_start = time.time()
         self.last_quota = QuotaReport(remaining_seconds, retry_seconds, time.time())
 
     def reset_in_seconds(self) -> float | None:

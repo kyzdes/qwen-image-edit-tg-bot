@@ -59,8 +59,9 @@ def _looks_like_quota_error(message: str) -> bool:
 # Парсинг точных чисел из текста ошибки квоты ZeroGPU.
 _RE_LEFT = re.compile(r"(\d+(?:\.\d+)?)\s*s(?:econds)?\s*left", re.IGNORECASE)
 _RE_VS = re.compile(r"vs\.?\s*(\d+(?:\.\d+)?)", re.IGNORECASE)
-_RE_RETRY_HMS = re.compile(r"retry in\s*(\d{1,2}:\d{2}(?::\d{2})?)", re.IGNORECASE)
-_RE_RETRY_S = re.compile(r"retry in\s*(\d+(?:\.\d+)?)\s*s", re.IGNORECASE)
+# HF пишет «Try again in 2:39:03» (или «retry in …») — ловим оба варианта.
+_RE_RETRY_HMS = re.compile(r"(?:try again|retry) in\s*(\d{1,2}:\d{2}(?::\d{2})?)", re.IGNORECASE)
+_RE_RETRY_S = re.compile(r"(?:try again|retry) in\s*(\d+(?:\.\d+)?)\s*s", re.IGNORECASE)
 
 
 def _parse_quota_numbers(message: str) -> tuple[float | None, float | None]:

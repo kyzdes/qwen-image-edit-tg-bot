@@ -156,11 +156,15 @@ def build_limits_text() -> str:
             lines.append("✅ Лимит уже должен был сброситься — можно генерировать.")
     elif lq is not None and lq.remaining_seconds is not None:
         lines.append(f"Свободно: ~{int(lq.remaining_seconds)} с GPU")
-        lines.append("Время до сброса HF в этот раз не сообщил.")
+        # HF не дал «try again in» — прикидываем сами от первой активности бота.
+        if t.window_start is not None:
+            lines.append(f"⏳ Сброс (оценка): через ~{_fmt_dur(t.reset_in_seconds())}")
+        else:
+            lines.append("⏳ Сброс: в течение 24ч после первого использования")
     else:
         if t.window_start is not None:
-            lines.append(f"⏳ Сброс окна бота: через ~{_fmt_dur(t.reset_in_seconds())}")
-        lines.append("Точные цифры появятся, когда упрёшься в лимит.")
+            lines.append(f"⏳ Сброс окна (оценка): через ~{_fmt_dur(t.reset_in_seconds())}")
+        lines.append("Точный остаток появится, когда упрёшься в лимит.")
 
     lines.append("")
     lines.append(f"Сделано ботом за сутки: {t.generations} генераций")
