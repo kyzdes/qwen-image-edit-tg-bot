@@ -24,6 +24,7 @@ Each phase consumes the artifact the previous one produced — the chain only wo
 
 ---
 
+
 ## Phase 1 — Discover & Analyze What You're Wrapping
 
 Before you write a single line of bot code, you must know exactly what you are calling: *what kind of thing it is*, its *exact I/O contract*, the *real knobs it exposes vs. what is hardcoded*, and its *hardware/cost/quota model*. Every fact in this phase must be **discovered empirically, not assumed** — guesses here become bugs that only surface in production. The one time we trusted a UI label over the source (the GPU-size question), we were wrong.
@@ -105,6 +106,15 @@ Reading the source gives you the *feature surface* — and, just as importantly,
 
 > **Why this matters:** capturing the exact adapter strings and defaults from source meant the bot reproduced the Space's intended results on the first try, and the menu offered *only* knobs that actually do something. Exposing a "resolution" slider that the Space ignores would be a lie to the user. **These verbatim strings flow straight into the shared contract (Phase 6.1) — copy them once, never retype them.**
 
+**Check whether the target model is gated — a gate is a hard wall, not a warning.** If your target wraps (or is) a model that is *gated* on the Hub, you cannot call it, prefetch it, or download its weights until a human has accepted the license **in the web UI** — there is no programmatic accept. The consent form (`Agree and access` on the model page) is a UI-only action; an API call against a gated repo just returns `403 Cannot access gated repo`. We hit this with `kpsss34/FHDR_Uncensored` and `black-forest-labs/FLUX.1-dev` (both `gated=auto`): every prefetch 403'd until the account clicked agree on the page. So during Discovery, check it explicitly:
+
+```python
+from huggingface_hub import model_info
+model_info("<owner>/<repo>").gated   # False, or "auto"/"manual" if gated
+```
+
+If it's gated, flag that a human must open the model page and accept *before* anything will work — and make sure the eventual error path (in the bot or the backend Space) names the **exact model id and its page** to accept, so the fix is obvious instead of a bare 403.
+
 ### 1.4 Map the hardware / cost / quota / rate-limit model
 
 This is where naive wrapping silently fails or runs up a bill. Build a precise mental model, and **prove the parts you can't see.**
@@ -121,7 +131,7 @@ This is where naive wrapping silently fails or runs up a bill. Build a precise m
 
 Overage is billed from credits at ~$1 / 10 min. Quota is consumed as `actual_seconds × size_multiplier` (xlarge = ×2), so the same wall-clock generation burns twice the budget at `xlarge` as at `large`.
 
-**Prove what the provider does NOT expose.** We captured *all* HTTP response headers during a live generation to confirm there is **no public API for remaining quota** — only generic rate-limit headers. The exact remaining-seconds and reset time appear **only in the quota-exceeded error text**. This empirical proof drives two downstream decisions: the bot must self-track usage (Phase 4 §4) and must parse the error text for the authoritative numbers (Phase 4 §4b / Phase 5 §5.5), because no clean API exists. (Don't take "there's no API" on faith — capture the headers and *show* there isn't.)
+**Prove what the provider does NOT expose.** We captured *all* HTTP response headers during a live generation to confirm there is **no public API for remaining quota** — only generic rate-limit headers. The exact remaining-seconds and reset time appear **only in the quota-exceeded error text**. This empirical proof drives two downstream decisions: the bot must self-track usage (Phase 4 §4) and must parse the error text for the authoritative numbers (Phase 4 §4b / Phase 5 §5.6), because no clean API exists. (Don't take "there's no API" on faith — capture the headers and *show* there isn't.)
 
 **Judge local-run feasibility deterministically.** Instead of guessing whether it would OOM, we summed the weight files against VRAM:
 
@@ -139,6 +149,10 @@ A subtraction beats a guess.
 
 Before any of the above, pull provider credentials from a secrets manager and authenticate the CLI **without ever echoing the value.** Auth is not a formality: it directly changes the quota you get (anonymous ≈ 2 min vs. PRO 40 min for the same Space). Discovery done anonymously will mislead you about real-world limits. Confirm which account/tier you authenticated as before trusting any quota number you observe.
 
+**If the backend is private, the token is mandatory just to *reach* it — not merely to raise your quota.** The quota point above assumes a *public* Space, where anonymous still connects (just with a tiny budget). A **private** Space is different in kind: `gradio_client` cannot connect to it *at all* without `token=` — you don't get a small quota, you get no connection. So when your target is private, discover that fact now and treat the auth token as a hard requirement of the bot's config, not an optional tier upgrade. (Carry this forward to Backend/Deploy: a missing token there is a connection failure, not a degraded one.)
+
+**If you're also building the backend Space yourself (not just wrapping someone else's), the contract is yours to define — but ZeroGPU and Gradio have sharp edges to discover up front.** Two we hit: (1) on **ZeroGPU**, each `@spaces.GPU` call runs in a *forked worker*, so a module-level pipeline cache does **not** persist reliably across calls — a multi-model Space must load the selected model *fresh per call* (prefetch all model files at module scope so the GPU window only reads from local disk). (2) **Gradio component kwargs are version-specific** — passing a newer kwarg the Space's Gradio doesn't support (e.g. `gr.Gallery(show_download_button=True)`) crashes the Space at startup with `RUNTIME_ERROR`. Note these now so they shape the backend you design; the full write-ups are the canonical Gotchas catalog entries (#19 ZeroGPU load-fresh-per-call, #20 version-specific Gradio kwargs).
+
 ### Discovery checklist
 
 Work top to bottom. Each box is a fact you *verified*, not assumed.
@@ -147,11 +161,13 @@ Work top to bottom. Each box is a fact you *verified*, not assumed.
 AUTH & CREDS
 [ ] Creds pulled from secrets manager; CLI authenticated; secret never printed
 [ ] Confirmed which account/tier you're authing as (it changes quota)
+[ ] Is the backend PRIVATE? If so, token is MANDATORY just to connect — flag it as required config
 
 CLASSIFY
 [ ] Determined target type: raw model | app/Space | REST API
 [ ] If a Space: pulled `hf spaces info --format json` (hw, sdk, files)
 [ ] Downloaded and READ app.py + requirements.txt (or the model card / OpenAPI spec)
+[ ] Checked model_info(repo).gated — if gated, a HUMAN must accept the license in the web UI first
 
 I/O CONTRACT (empirical)
 [ ] Ran view_api() (Space) / read OpenAPI (REST) — got the exact endpoint + ordered params
@@ -195,6 +211,30 @@ Run a real brainstorming/clarification step before proposing anything. But brain
 | What did Phase 1 reveal about the backend? | Re-read your contract-sheet notes | The input type and quota model constrain the whole UX |
 
 Only after this do you ask the questions you couldn't answer from context.
+
+### Step 1.5 — Decide the flow SHAPE: input-bearing vs prompt-only
+
+Before the forks, settle one binary that the whole skeleton hangs on: does the bot **carry a user-supplied artifact through the flow, or not?** This shape is upstream of everything — the menu, the state machine, and the handlers all fall out of it differently. Pick it now, on paper, so Phase 3 (Menus) and Phase 4 (State) aren't building against an unstated assumption.
+
+The two shapes seen across real builds:
+
+- **Input-bearing** — the user supplies an artifact, you **store it**, then operate on it. Bot #1 was this: upload a photo → stash it as session state → every feature acts on that stored image. The flow needs a photo (or file/voice) handler that captures and persists the artifact *before* any generation, and free text later is contextual (a custom prompt or a typed setting), which is exactly what forces the awaiting-state machine.
+- **Prompt-only** — there is **no upload**; the user picks a model and sends a text prompt, and the text *is* the input. Bot #2 (text-to-image) was this: pick a model → type a prompt → generate. There is no photo handler and nothing to stash; free text routes **straight to generation** as the prompt. The state machine is lighter because there's no stored artifact to thread through.
+
+Two skeletons, side by side:
+
+```
+INPUT-BEARING                         PROMPT-ONLY
+send <artifact>  → store it           pick a model
+   ↓                                     ↓
+feature menu (acts on stored input)   send text prompt  → that text IS the input
+   ↓                                     ↓
+pick feature / type custom prompt     generate
+   ↓                                     ↓
+generate (against stored artifact)    result
+```
+
+Don't blur the two: a prompt-only bot that grows a stray photo handler, or an input-bearing bot that forgets to persist the artifact, is the "wrong shape" failure this phase exists to prevent. Name the shape here; the menu + state machine follow from it. (This decision then *feeds* Fork 1 — it fixes whether "core user input" is a stored artifact or the prompt text itself.)
 
 ### The 4 architecture-defining forks (generalized)
 
@@ -561,7 +601,7 @@ for part in match.group(1).split(":"):   # "2:39:03" → 9543
 - [ ] Store `(captured_at, retry_seconds)` and compute the live countdown on read.
 - [ ] A quota *error* is also activity — open the window on it too, so the reset estimate works even with zero successful generations this session.
 
-> The two regex/countdown traps above are the *same* facts the Backend phase relies on for honest quota wording — Phase 5 §5.5 references this section rather than repeating the parsing logic.
+> The two regex/countdown traps above are the *same* facts the Backend phase relies on for honest quota wording — Phase 5 §5.6 references this section rather than repeating the parsing logic.
 
 ### 5. Durable persistence: atomic write to a mounted volume, fail soft
 
@@ -600,6 +640,40 @@ def _load(self) -> None:
 - [ ] **Best-effort everywhere:** every IO path is wrapped; any failure logs a warning and falls back to in-memory operation. A bot that crashes because it couldn't write a stats file is worse than one with slightly stale stats.
 - [ ] **Treat `FileNotFoundError` as normal** (first boot), distinct from real IO errors. Don't log a scary warning on a clean first start.
 - [ ] **`_save()` on every mutating event** (each generation, each quota error). The state is tiny; the cost is negligible and you never lose more than the last action.
+
+### 5b. (Space-side, optional) Persist generation history to a *private HF dataset*
+
+The mounted-volume pattern above is the right tool when *you* control the host (Dokploy, your VPS). But sometimes the thing that must survive a restart lives on the **Space side** — e.g. a Space that hosts a gallery of every image it has ever generated. A HF Space **without paid persistent storage loses every file on restart**, and the `/data` named-volume trick isn't available there. The free, durable alternative is to **treat a private HF dataset repo as the persistence layer**.
+
+The pattern: per generation, push the image plus a tiny caption sidecar to a **private** dataset repo (`huggingface_hub.create_commit`, one commit per image); on startup, pull the whole thing back into the gallery (`snapshot_download` of that dataset). It's free, it survives restarts, and the history is browsable and downloadable straight from the dataset page.
+
+```python
+from huggingface_hub import create_commit, CommitOperationAdd, snapshot_download
+
+def persist_generation(img_bytes: bytes, caption: str, name: str) -> None:
+    try:                                  # best-effort: a dataset hiccup must NOT crash the app
+        create_commit(
+            repo_id=HISTORY_DATASET, repo_type="dataset", token=HF_TOKEN,
+            operations=[
+                CommitOperationAdd(f"images/{name}.png", img_bytes),
+                CommitOperationAdd(f"images/{name}.txt", caption.encode("utf-8")),
+            ],
+            commit_message=f"add {name}",
+        )
+    except Exception as exc:
+        logger.warning("history push failed: %s", exc)
+
+def load_history() -> str:
+    try:
+        return snapshot_download(repo_id=HISTORY_DATASET, repo_type="dataset", token=HF_TOKEN)
+    except Exception as exc:
+        logger.warning("history pull failed: %s", exc); return ""
+```
+
+- [ ] **Make the dataset *private*** — generation history is user content, not something to leak publicly. The same `HF_TOKEN` the Space already uses for its backends authorizes the commits.
+- [ ] **One commit per image, with a sidecar** — the `.txt` (or `.json`) caption next to the image keeps the prompt/seed/settings attached, so the gallery can re-render labels after a `snapshot_download` with no separate index.
+- [ ] **Pull on startup, push per generation** — `snapshot_download` once at boot rehydrates the gallery; each new generation appends a commit. The dataset *is* the source of truth across restarts.
+- [ ] **Best-effort, exactly like the volume writer** — wrap both push and pull in try/except and log a warning. A dataset outage should degrade to "this session's images only," never take down the Space. Same principle as job 5: persistence failures are warnings, not crashes.
 
 ### Phase 4 done-check (run before claiming this layer works)
 
@@ -647,6 +721,8 @@ def make_client(space_id, token):
 - [ ] Log (WARN) which auth path won — anonymous must be visible in logs, not a silent surprise.
 - [ ] Confirm with a live call that you got the *authenticated* quota, not the anon one.
 
+**A PRIVATE backend needs a token just to be *reached* — this is not the same as the quota point above.** The 20× story is about a **public** Space, where anonymous still connects (you just inherit the tiny anon quota). A **private** Space is different in kind: `gradio_client` **cannot connect to it at all** without `token=` — there is no anonymous fallback, the handshake itself fails. So when the backend is private, the token is **mandatory, not best-effort**: the bot config must *require* it (validate at startup and refuse to run without it), and the auth-discovery fallback chain has no "anonymous" rung to land on — if every authed path fails, that's a hard config error, not a degraded mode.
+
 ### 5.2 Never block the event loop
 
 `python-telegram-bot` runs on one asyncio loop. A blocking backend call (a `gradio_client.predict()` that takes 25–60s) will **freeze every other user's interaction** for the whole generation. Wrap every blocking backend call:
@@ -682,13 +758,46 @@ async def infer(...):
 - [ ] Client created lazily, cached in a module global / singleton.
 - [ ] On connection error: null the cache, recreate, retry **exactly once** (don't loop — a hard-down Space should surface as an error, not hang).
 
-### 5.4 Error taxonomy — one message per failure class
+### 5.4 One bot, several backends — route by model, not by guesswork
+
+A single bot can wrap **multiple backends with different signatures**, and the cached-singleton client above becomes a *small map* of clients rather than one global. Real example: two Spaces, both exposing a `/generate` endpoint, but with diverging arg lists —
+
+- `generate(model_label, prompt, negative, steps, guidance, seed, randomize)`
+- `generate(model_label, prompt, steps, guidance, seed, randomize)` — **no `negative` arg.**
+
+If you build one universal argument list, you'll pass `negative` to a Space that doesn't take it (or drop it from one that needs it) and get a confusing positional-arg mismatch. The fix is to make the **model catalog the source of truth**: tag every model with the backend it lives on, then let the client pick the Space *by backend* and build the **per-backend argument list** (include or omit `negative`, reorder as that backend expects). Keep **one cached `gradio_client.Client` per backend** — the same lazy/cached/reconnect-once rules from 5.3 apply, just keyed by backend id.
+
+```python
+_clients: dict[str, Client] = {}            # keyed by backend id, not one global
+def get_client(backend):
+    if backend not in _clients:
+        _clients[backend] = make_client(SPACES[backend], TOKEN)
+    return _clients[backend]
+
+def build_args(model):                       # per-backend arg list from the catalog
+    a = [model.label, model.prompt]
+    if model.backend == "sdxl":              # this backend takes a negative prompt
+        a.append(model.negative)
+    a += [model.steps, model.guidance, model.seed, model.randomize]
+    return a
+```
+
+- [ ] Each model in the catalog is tagged with its backend; the client routes on that tag, never on a hardcoded default.
+- [ ] The argument list is built **per backend** (include/omit/reorder), not shared across backends.
+- [ ] One cached client per backend, each following the lazy + reconnect-once discipline of 5.3.
+
+**Per-backend setting defaults.** When one bot spans model families, the *good* defaults diverge with the backend — so defaults must travel with the model, not be global constants. Concretely: **SDXL/Pony** models want **CFG ≈ 6 plus a negative prompt**; **FLUX** models want **guidance ≈ 3.5 and no negative** (passing a negative or a CFG of 6 to FLUX produces worse output, not an error — a silent quality bug). Either set sensible per-backend defaults the moment the user picks a model, or — at minimum — state the recommended values in the model-pick message so the user isn't flying blind.
+
+- [ ] Defaults (CFG/guidance, negative on/off) are attached to the backend, applied on model selection.
+- [ ] If you don't auto-apply them, the model-pick message states the recommended values explicitly.
+
+### 5.5 Error taxonomy — one message per failure class
 
 A single "something went wrong" is useless to the user *and* to you in the logs. Classify the failure and give each class a distinct, actionable message. Build it once in the client wrapper as typed exceptions (these named exceptions are part of the shared contract, Phase 6.1); the handler just maps type → text.
 
 | Failure class | How it presents | Retryable? | User-facing message |
 |---|---|---|---|
-| **QuotaExceeded** | Provider error text with remaining/reset numbers | No — wait | Carry the *parsed* numbers: "~X s left, resets in H:MM:SS" (see 5.5) |
+| **QuotaExceeded** | Provider error text with remaining/reset numbers | No — wait | Carry the *parsed* numbers: "~X s left, resets in H:MM:SS" (see 5.6) |
 | **Transient connection** | `ConnectionError`, timeout, reset handshake | Yes — auto | "Hiccup talking to the backend — retrying…" then the one-shot retry from 5.3 |
 | **Generic SpaceError** | Any other backend exception | No (fatal) | Friendly "the model failed on that one — try again or tweak the prompt" |
 
@@ -696,7 +805,7 @@ A single "something went wrong" is useless to the user *and* to you in the logs.
 - [ ] `QuotaExceeded` carries structured data (remaining seconds, reset countdown), not just a message.
 - [ ] Transient errors are the only auto-retried class; quota and generic are not.
 
-### 5.5 Honest quota wording — reservation vs exhaustion
+### 5.6 Honest quota wording — reservation vs exhaustion
 
 The single most important integrity rule of this phase. The provider's quota error usually fires **when remaining < the reservation the task needs** — *not* at literal zero. If you parrot "quota exhausted," you'll lie to the user while there's still time on the clock.
 
@@ -718,7 +827,7 @@ def quota_message(remaining_s: int | None, reset_s: int | None) -> str:
 - [ ] "Exhausted" is reserved for true zero; otherwise "can't start now, task reserves X."
 - [ ] State the reservation size in the message so the user understands *why* (e.g., "xlarge ×2").
 
-### 5.6 Provider-side resource tuning — dynamic GPU duration
+### 5.7 Provider-side resource tuning — dynamic GPU duration
 
 If you also control the backend (a Space you own/duplicated), tune its **GPU reservation** so generations can start with *less* remaining quota. Use a callable duration in the GPU decorator:
 
@@ -732,11 +841,13 @@ def infer(...): ...
 
 > Caveat from the field: a backend you don't fully own can betray you silently. A duplicated Space inherited the source image, so a copy that reported `RUNNING` was still running the *old* `xlarge` code — proven because its reservation logged "120s requested" (= 60 × 2). Lesson: **verify the backend is actually the build you think it is** (check the reservation math / a version marker in logs) before trusting it, and never ship a toggle that points at a backend that isn't confirmed working. (This is the same incident that motivates the "park, don't fake" principle — see the Engineering Principles and Phase 7.6.)
 
-### 5.7 Phase 5 exit checklist
+### 5.8 Phase 5 exit checklist
 
 - [ ] Auth kwarg discovered at runtime; confirmed running on the PRO (40-min) quota, not anonymous.
+- [ ] If any backend is **private**, the token is required at startup (no anonymous fallback exists — connection itself fails without it).
 - [ ] Every blocking backend call is off the event loop (`asyncio.to_thread`).
-- [ ] Client is lazy, cached, and recreates-once on connection error.
+- [ ] Client is lazy, cached, and recreates-once on connection error — one cached client **per backend** if the bot wraps several.
+- [ ] Models tagged with their backend; per-backend arg lists and setting defaults (e.g. SDXL CFG≈6 + negative vs FLUX guidance≈3.5, no negative) applied on selection.
 - [ ] Three typed error classes, three distinct user messages; only transient is auto-retried.
 - [ ] Quota messaging distinguishes "can't start (reservation)" from "exhausted (true zero)," consuming the countdown parsed in Phase 4 §4b.
 - [ ] If you own the backend: dynamic GPU duration set, and the running build verified to be the one you intended.
@@ -900,12 +1011,33 @@ only one bot instance is running
 Create the app via the Dokploy API/MCP in this order. Each step has a non-obvious requirement called out.
 
 1. **Project + application.** One project per bot keeps env, volumes, and logs scoped together.
-2. **Git source — `customGitUrl` pointing at a PUBLIC GitHub repo.** This is the bulletproof choice: no GitHub-App permission ambiguity, no token to manage on the Dokploy side, deploys "just work." It's only safe because **the code has no secrets** — all secrets are injected as env vars (7.4). If your repo must be private, you've usually leaked a secret into it; fix that first.
+2. **Git source — pick the connection by repo visibility (see the decision tree below).** A **PUBLIC repo + `customGitUrl`** is the bulletproof default: no GitHub-App permission ambiguity, no token to manage on the Dokploy side, deploys "just work." It's safe because **the code has no secrets** — all secrets are injected as env vars (7.4), so the source itself is fine to expose.
+
+   But "public" is a *choice*, not a law. A bot can legitimately need a **PRIVATE repo** — e.g. it wraps private/NSFW backends and you don't want the catalog, prompts, or backend Space IDs world-readable. `customGitUrl` **cannot clone a private repo** (Dokploy has no credentials for it), so the deploy fails at the clone step with no useful error. Decision tree:
+
+   - **Public repo →** `customGitUrl`. Always prefer this when you can.
+   - **Private repo, Dokploy GitHub App installed →** wire the source with `application.saveGithubProvider`, passing the `githubId` you read from `gitProvider.getAll`. The App carries the clone credentials, so a private repo deploys cleanly (this is the path that worked for the private-backend bot).
+   - **Private repo, no GitHub App →** fall back to a PAT embedded in the `customGitUrl` (`https://<user>:<pat>@github.com/...`) — workable but now you're managing a token on the Dokploy side, so treat it with 7.4 hygiene.
+   - **Last resort →** make the repo public (only valid once you've re-confirmed there are genuinely no secrets in it).
+
+   Don't reach for the App or a PAT out of habit: if the repo *can* be public, `customGitUrl` is still the least-moving-parts option.
 3. **Build type — `dockerfile`.** Note the API requires **all 7 build fields** present in the request even when most are defaults; send the full object or the call rejects.
 4. **Environment — via `saveEnvironment`.** Inject secret *values* from the secrets manager directly into the request body. Never echo a value into the transcript or a log (see 7.4).
 5. **`updateConfig.Order = stop-first`** (from 7.2) — set before the first deploy.
 6. **A named volume mounted at `/data`** (`mounts.create type=volume`, see 7.5) — create before deploy so the first run already has durable storage.
 7. **Trigger `application.deploy`.** Gotcha: `title` and `description` must be **non-null strings**, or the deploy call is rejected.
+
+### 7.3a Run the whole Dokploy deploy as ONE process (not a chain of shell calls)
+
+The provisioning sequence in 7.3 is half a dozen API calls whose outputs feed the next call (the project id feeds `application.create`, the app id feeds every `save*` and `deploy`, etc.). The tempting shape is a shell script: `bash dokploy-api.sh project.create | parse`, then `bash ... application.create | parse`, and so on — each call wrapped in a `$(...)` command-substitution and each parsed by another `python -c $(...)`. **Don't.** The agent's execution sandbox intermittently fails to fork subprocesses — `failed to change group ID: operation not permitted` — after roughly 3–4 forks inside a *single* shell invocation. A multi-step shell deploy blows that fork budget and dies partway through, leaving a half-created app you now have to clean up by hand.
+
+**Robust shape: do the entire deploy in ONE process.** A single Python script using `httpx` straight against the Dokploy REST API, calling the endpoints in sequence and keeping the ids in memory between calls:
+
+- Base URL `https://dokploy.moone.dev`, header `x-api-key: <key>`.
+- Endpoints, in order: `/api/project.create` → `/api/application.create` → `/api/application.saveGithubProvider` (or the customGitUrl variant) → `/api/application.saveBuildType` → `/api/application.saveEnvironment` → `/api/application.update` (for `updateConfig.Order=stop-first`) → `/api/application.deploy`, then poll `/api/deployment.all`.
+- **Build the env body with secret values held in memory only.** Read each secret from a file that was injected just beforehand, use it to construct the `saveEnvironment` body, then **delete the file immediately**. The value is never echoed to the transcript or interpolated on a shell command line.
+
+One process means **one fork → no fork-budget problem**, the call graph is plain Python (no fragile `$()` parsing of JSON between steps), and secrets stay in process memory where 7.4's hygiene rules hold automatically. Reserve loose `bash dokploy-api.sh ...` one-shots for *single* read-only pokes (e.g. checking one deployment's status); never chain the build-out itself across shell calls.
 
 ### 7.4 Secret hygiene (never let a value touch the transcript)
 
@@ -995,19 +1127,25 @@ Every concrete trap from this build, with the root cause and the fix. Each appea
 | 3 | Telegram output | Caption-too-long `BadRequest` | Telegram caption limit is 1024 chars | Truncate the prompt portion (cap ~700) and hard-cap the whole caption at 1024 (Phase 4 §3) | `BadRequest` in prod logs |
 | 4 | Telegram output | Upscaled / high-res image comes back degraded | Sending as a *photo* makes Telegram recompress it | Send high-res results as a **document** (uncompressed) (Phase 4 §3) | Platform behavior |
 | 5 | Quota parsing | UI wrongly says reset time "not reported" | Regex matched `"retry in"`, but the provider's wording is `"Try again in H:MM:SS"` | Match the **actual** wording, parse `H:MM:SS` → seconds, recompute the countdown from the captured "now" timestamp (Phase 4 §4b) | Reset time was *never* parsed until the keyword was corrected |
-| 6 | Quota wording | Message says "exhausted" while quota remains | Quota error fires when remaining < the **reservation** the task needs, not at literal zero | Say "can't start now: ~X s left, the task reserves more (xlarge ×2)"; only say "exhausted" at true zero (Phase 5 §5.5) | Misleading wording found in testing |
+| 6 | Quota wording | Message says "exhausted" while quota remains | Quota error fires when remaining < the **reservation** the task needs, not at literal zero | Say "can't start now: ~X s left, the task reserves more (xlarge ×2)"; only say "exhausted" at true zero (Phase 5 §5.6) | Misleading wording found in testing |
 | 7 | Quota API | No way to read remaining quota live | HF exposes **no** public quota API — only generic rate-limit headers | Self-track usage (count + GPU-minute estimate) over a rolling 24h window; parse exact numbers only from the quota-error text (Phase 1.4 / Phase 4 §4) | Proved by capturing **all** response headers during a live generation |
 | 8 | Backend auth | Anonymous-tier tiny quota (~2 min) instead of PRO 40 min | Auth kwarg differs by version: gradio_client 2.5.0 wants `token=`, not `hf_token=`; if wrong, falls through to anonymous | Inspect the signature; fall back `token=` → `hf_token=` → `Authorization: Bearer` header → anonymous (Phase 5 §5.1) | Auth tier directly sets your quota ceiling |
 | 9 | Async | Bot event loop stalls during generation | Blocking gradio_client calls run on the PTB event loop | Wrap every blocking backend call in `asyncio.to_thread` (Phase 5 §5.2) | python-telegram-bot is async |
 | 10 | Backend resilience | A transient connection error kills the request | Cached client went stale | Lazily create + cache the client; on connection error, recreate **once** and retry (Phase 5 §5.3) | Spaces restart; handshakes go stale |
-| 11 | GPU reservation | A generation refuses to start even with quota left | First-time LoRA download happens *inside* the GPU function, so a fixed reservation over-reserves | `@spaces.GPU(duration=callable)`: 60s when the LoRA isn't loaded, 25s when cached — a smaller reservation lets a job start with less remaining quota (Phase 5 §5.6) | Does **not** reduce per-gen cost (billed by actual time × multiplier), only the start threshold |
+| 11 | GPU reservation | A generation refuses to start even with quota left | First-time LoRA download happens *inside* the GPU function, so a fixed reservation over-reserves | `@spaces.GPU(duration=callable)`: 60s when the LoRA isn't loaded, 25s when cached — a smaller reservation lets a job start with less remaining quota (Phase 5 §5.7) | Does **not** reduce per-gen cost (billed by actual time × multiplier), only the start threshold |
 | 12 | Deployment | `Conflict: terminated by other getUpdates request` | Swarm default `start-first` update order briefly runs **two** containers → two pollers | Set app `updateConfig Order=stop-first`; keep exactly **1 replica** (Phase 7 §7.2) | Exact error string in prod logs |
-| 13 | Deployment | "Live" backend silently runs old code | Duplicating a Space inherits the source image; a copy showing RUNNING still ran the old xlarge code | Don't trust the RUNNING badge — verify with a real call; here the "120s requested" reservation (60×2) proved it (Phase 5 §5.6 / Phase 7 §7.6) | Reservation math exposed the stale image |
+| 13 | Deployment | "Live" backend silently runs old code | Duplicating a Space inherits the source image; a copy showing RUNNING still ran the old xlarge code | Don't trust the RUNNING badge — verify with a real call; here the "120s requested" reservation (60×2) proved it (Phase 5 §5.7 / Phase 7 §7.6) | Reservation math exposed the stale image |
 | 14 | Deployment infra | Build fails instantly, no logs | Provider build infra stuck — `exit 128`, log only shows "Build Queued" | Park the feature, keep a rollback artifact, don't ship a fake toggle (Principle 3) | Live-streamed build log as evidence |
 | 15 | Persistence | Limit countdown / counters reset on redeploy | State only in memory | Atomic save (write tmp → `os.replace`) of tracker JSON to a **named volume at `/data`**; best-effort fallback to in-memory; path overridable via `STATE_FILE` (Phase 4 §5) | Survives restarts **and** redeploys |
 | 16 | State validation | Out-of-range settings reach the backend | No clamping | Clamp at the edge: steps 1..50, guidance 1.0..10.0, seed 0..2147483647, with module-level limit constants (Phase 4 §1) | — |
 | 17 | Callback data | Inline button silently fails | Telegram caps `callback_data` at 64 bytes | Single documented compact scheme (`f:<key>`, `d:<key>:<idx>`, `s:steps:+`, …); orchestrator asserts every keyboard's `callback_data` ≤ 64 bytes (Phase 3 / Phase 6.4) | Caught by the build-time assertion, not in prod |
 | 18 | Secret hygiene | Token leaks into transcript / logs | Echoing values during env setup or diagnostics | Inject secrets into an env file; reference env vars in API bodies; **mask tokens** in all log/diagnostic output (Phase 7 §7.4) | Standard, enforced throughout |
+| 19 | ZeroGPU multi-model | Model dropdown is ignored — the Space always renders the same model/style | A module-level pipeline cache doesn't persist across calls: ZeroGPU forks a fresh worker per `@spaces.GPU` call, so mutations to the global cache are unreliable | Inside the `@spaces.GPU` function, load the **selected** model fresh **every** call; `snapshot_download` **all** model files at module level so the GPU window only loads from local disk, never the network. Correctness over the ~15-30 s switch-reload cost | Observed on a multi-model comparison stand — the dropdown selection never took effect with a cross-call cache |
+| 20 | Gradio version skew | Space dies at startup with `RUNTIME_ERROR` (`Gallery.__init__() got an unexpected keyword argument 'show_download_button'`) | A newer gradio component kwarg doesn't exist in the gradio version that Space actually runs | Don't assume newer kwargs exist — verify each component kwarg against the **runtime** gradio version. (Here it was unnecessary anyway: the gallery's per-image download lightbox is on by default) | The exact `RUNTIME_ERROR` in the Space's startup log |
+| 21 | Gated models | `403 Cannot access gated repo` when calling or prefetching a model | The model is `gated` and its license was never accepted for this account; the accept is a **UI consent form** with no clean programmatic path | A human must click "Agree and access" **once in the web UI** on the model page. On Discovery, check `model_info(repo).gated`; if gated, the error path must name the **exact model + page** to accept | `kpsss34/FHDR_Uncensored`, `black-forest-labs/FLUX.1-dev` are `gated=auto` — prefetch 403'd until accepted in the UI |
+| 22 | Backend reachability | `gradio_client` can't even **connect** to the backend Space | The Space is **PRIVATE** — without a token you cannot reach it at all (distinct from gotcha #8, where a PUBLIC space still connects anonymously at a tiny quota) | When the backend is private, the auth token is **mandatory** — make the bot config **require** it; pass `token=` to reach the Space (Phase 5 §5.1) | A private Space refused the handshake entirely until `token=` was supplied |
+| 23 | Deploy (private repo) | Dokploy can't clone a **PRIVATE** repo via `customGitUrl` | `customGitUrl` carries no credentials; a private repo needs auth to clone | Public repo → `customGitUrl` (no creds, bulletproof). Private repo → Dokploy **GitHub App** `application.saveGithubProvider` with the `githubId` from `gitProvider.getAll`; else a PAT embedded in `customGitUrl`; else make the repo public (Phase 7) | The GitHub-App path cloned bot #2's private repo where `customGitUrl` couldn't |
+| 24 | Deploy (sandbox forks) | A multi-step shell deploy dies partway through with `failed to change group ID: operation not permitted` | The execution sandbox intermittently fails subprocess forks after ~3-4 forks in a **single** Bash invocation; a deploy made of many `$(bash dokploy-api.sh …)` + python-parse `$()`s blows that budget | Run the **entire** Dokploy deploy as **one** Python process — `httpx` straight to the REST API (`x-api-key` header; `/api/project.create`, `/api/application.create`, `.saveGithubProvider`, `.saveBuildType`, `.saveEnvironment`, `.update`, `.deploy`, `/api/deployment.all`), building the env body in memory, reading injected secret files and deleting them immediately. One process = one fork = no budget issue, and secrets are never echoed (Phase 7 §7.4) | The fork error reproduced reliably after 3-4 command-substitutions in one Bash call |
 
 ---
 
@@ -1055,7 +1193,7 @@ Below is a summary of the substantive fixes I made (the document above is the co
 
 **Connective tissue (the main gap):** Rewrote the "Pipeline at a glance" so each phase explicitly names the artifact it *produces* and *consumes* (Discover → contract sheet → Design → approved flow → Menus/Data/Backend). Added forward/back references at every phase boundary (e.g., Phase 2 "you have its contract sheet in hand"; Phase 6.1 now states the contract is "the union of every prior phase's decisions" with a Source-phase column in its table).
 
-**Duplication (each gotcha once):** The H:MM:SS / "Try again in" regex parsing was fully spelled out in *both* Phase 4 §4b and Phase 5 §5.5. I made Phase 4 the single owner of parsing and rewrote Phase 5.5 to *consume* the already-parsed `(remaining, reset)` from the typed `QuotaExceeded` exception (deciding only wording) — removing the duplicated regex and the contradiction where 5.5 re-parsed strings the taxonomy said the handler should never touch. Labeled the Gotchas catalog as the canonical single home and pointed each entry at one fix location.
+**Duplication (each gotcha once):** The H:MM:SS / "Try again in" regex parsing was fully spelled out in *both* Phase 4 §4b and Phase 5 §5.6. I made Phase 4 the single owner of parsing and rewrote Phase 5.6 to *consume* the already-parsed `(remaining, reset)` from the typed `QuotaExceeded` exception (deciding only wording) — removing the duplicated regex and the contradiction where 5.6 re-parsed strings the taxonomy said the handler should never touch. Labeled the Gotchas catalog as the canonical single home and pointed each entry at one fix location.
 
 **Correctness fixes vs. ground truth:**
 - The `on_text` example used `session.settings.seed = clamp_seed(...)` and `session.current_prompt` / `session.current_image`, inconsistent with the Phase 4 dataclass (`image_b64`, `prompt`, `settings.set_seed`). Unified the field names across Phases 3 and 4.
