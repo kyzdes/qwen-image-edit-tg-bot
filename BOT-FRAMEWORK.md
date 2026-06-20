@@ -841,7 +841,32 @@ def infer(...): ...
 
 > Caveat from the field: a backend you don't fully own can betray you silently. A duplicated Space inherited the source image, so a copy that reported `RUNNING` was still running the *old* `xlarge` code — proven because its reservation logged "120s requested" (= 60 × 2). Lesson: **verify the backend is actually the build you think it is** (check the reservation math / a version marker in logs) before trusting it, and never ship a toggle that points at a backend that isn't confirmed working. (This is the same incident that motivates the "park, don't fake" principle — see the Engineering Principles and Phase 7.6.)
 
-### 5.8 Phase 5 exit checklist
+### 5.8 If you own the backend Space — per-type recipes (image SDXL · text chat)
+
+When you build the backend Space yourself (not just wrap someone else's), two types recur, each with sharp edges found in the field. Both obey the **ZeroGPU load-fresh-per-call** rule (gotcha #19): `snapshot_download` every model's files at module scope, then load the *selected* model fresh inside the `@spaces.GPU` function (a forked worker won't keep a CUDA object across calls).
+
+**(a) SDXL image generation — the bulletproof combo.** Naive SDXL on ZeroGPU fails two *silent* ways: the fp16 VAE overflows → a 200 + a full-frame **noise/black** PNG with no exception, and swapping in `DPMSolverMultistepScheduler(use_karras_sigmas=True)` → an **`IndexError`** in the denoise loop (`sigmas[step_index+1]`, which a `TypeError` guard won't catch). The combo that just works:
+
+```python
+from diffusers import AutoencoderKL, AutoPipelineForText2Image, EulerAncestralDiscreteScheduler
+DTYPE = torch.float16
+vae = AutoencoderKL.from_pretrained("madebyollin/sdxl-vae-fp16-fix", torch_dtype=DTYPE)  # prefetch this repo too
+pipe = AutoPipelineForText2Image.from_pretrained(MODEL_ID, vae=vae, torch_dtype=DTYPE).to("cuda")
+pipe.scheduler = EulerAncestralDiscreteScheduler.from_config(pipe.scheduler.config)
+```
+
+- fp16 + the **fp16-fix VAE** kills the noise/black failure; **Euler a** is robust and never index-errors.
+- **Look at the pixels** in your smoke test — a "successful" call can still return noise (gotchas #25, #26).
+
+**(b) Text / LLM chat — transformers on ZeroGPU.** Expose a stable `/chat(model_label, message, history_json, system, temperature, max_tokens) -> reply` endpoint (history as a JSON string of OpenAI-style messages keeps the `gradio_client` contract simple). Two chat-template traps:
+
+- **Qwen3 / "thinking" models leak chain-of-thought** — a `<think>…</think>` regex strip fails when `max_tokens` truncates before the closing tag. Kill it at the source: `tokenizer.apply_chat_template(msgs, add_generation_prompt=True, enable_thinking=False)` — non-thinking templates ignore the unknown kwarg, so pass it unconditionally.
+- **Gemma has no `system` role** — its template raises if you send one; fold the system text into the **first user message** instead.
+- Decode **only the new tokens** (`out[0][input_len:]`), clamp `max_tokens`, and prefer **bf16** (Qwen3/Llama/Gemma are bf16-native; fp16 can NaN). (gotcha #28)
+
+> Latency tradeoff: load-fresh-per-call means **every chat turn reloads the model** (~10s warm small model, ~100s cold 12B). Fine for a "try this model" stand; for interactive chat, flag it to the user — ZeroGPU is bursty by design, not an always-on serving tier.
+
+### 5.9 Phase 5 exit checklist
 
 - [ ] Auth kwarg discovered at runtime; confirmed running on the PRO (40-min) quota, not anonymous.
 - [ ] If any backend is **private**, the token is required at startup (no anonymous fallback exists — connection itself fails without it).
@@ -851,6 +876,8 @@ def infer(...): ...
 - [ ] Three typed error classes, three distinct user messages; only transient is auto-retried.
 - [ ] Quota messaging distinguishes "can't start (reservation)" from "exhausted (true zero)," consuming the countdown parsed in Phase 4 §4b.
 - [ ] If you own the backend: dynamic GPU duration set, and the running build verified to be the one you intended.
+- [ ] If you own an **SDXL** Space: fp16-fix VAE + Euler a (no noise/black, no scheduler IndexError); smoke test **inspected the actual pixels**, not just "no exception."
+- [ ] If you own a **chat** Space: `enable_thinking=False` + Gemma system-fold handled; decode only new tokens; per-turn reload latency flagged to the user.
 
 ---
 
@@ -1022,7 +1049,7 @@ Create the app via the Dokploy API/MCP in this order. Each step has a non-obviou
 
    Don't reach for the App or a PAT out of habit: if the repo *can* be public, `customGitUrl` is still the least-moving-parts option.
 3. **Build type — `dockerfile`.** Note the API requires **all 7 build fields** present in the request even when most are defaults; send the full object or the call rejects.
-4. **Environment — via `saveEnvironment`.** Inject secret *values* from the secrets manager directly into the request body. Never echo a value into the transcript or a log (see 7.4).
+4. **Environment — via `saveEnvironment`.** Inject secret *values* from the secrets manager directly into the request body. Never echo a value into the transcript or a log (see 7.4). The REST endpoint also requires `buildArgs`, `buildSecrets`, and `createEnvFile` to be **present** (e.g. `""`, `""`, `true`) — not just `{applicationId, env}` — or it 400s *"expected nonoptional, received undefined."* Tip: `application.update` can set `buildType`+`dockerfile`+`updateConfig.Order=stop-first`+`replicas` in **one** call, sidestepping `saveBuildType`'s many required-nullable fields (gotcha #29).
 5. **`updateConfig.Order = stop-first`** (from 7.2) — set before the first deploy.
 6. **A named volume mounted at `/data`** (`mounts.create type=volume`, see 7.5) — create before deploy so the first run already has durable storage.
 7. **Trigger `application.deploy`.** Gotcha: `title` and `description` must be **non-null strings**, or the deploy call is rejected.
@@ -1038,6 +1065,22 @@ The provisioning sequence in 7.3 is half a dozen API calls whose outputs feed th
 - **Build the env body with secret values held in memory only.** Read each secret from a file that was injected just beforehand, use it to construct the `saveEnvironment` body, then **delete the file immediately**. The value is never echoed to the transcript or interpolated on a shell command line.
 
 One process means **one fork → no fork-budget problem**, the call graph is plain Python (no fragile `$()` parsing of JSON between steps), and secrets stay in process memory where 7.4's hygiene rules hold automatically. Reserve loose `bash dokploy-api.sh ...` one-shots for *single* read-only pokes (e.g. checking one deployment's status); never chain the build-out itself across shell calls.
+
+### 7.3b Provisioning a ZeroGPU **backend** Space (when you build it, not just wrap it)
+
+If the bot's backend is a Space *you* create, the reliable way to get **ZeroGPU** hardware is to **duplicate an existing working ZeroGPU Space**, then overwrite its code — a fresh `create_repo` Space defaults to CPU, and `duplicate_space` *requires* the hardware flavor named explicitly:
+
+```python
+api.duplicate_space(SRC_ZEROGPU_SPACE, "owner/new-space", private=True, hardware="zero-a10g")
+api.add_space_secret(repo_id="owner/new-space", key="HF_TOKEN", value=tok)   # secrets are NOT copied
+api.upload_folder(repo_id="owner/new-space", repo_type="space",
+                  folder_path="./space", ignore_patterns=["__pycache__*"])   # overwrites app.py etc.
+```
+
+- `hardware="zero-a10g"` is the ZeroGPU API flavor (HF runs it on H200; `@spaces.GPU(size=…)` still picks large/xlarge). Omit it and `duplicate_space` 400s *"Hardware must be specified."* (gotcha #27)
+- **Secrets don't copy** — re-set `HF_TOKEN` (and friends) on each new Space, or the module-scope prefetch/load of private or rate-limited model repos fails at request time.
+- **Disk sizing:** a Space's container disk is ~50 GB and startup-cached model weights count against it, so **don't pack too many big models into one Space** — 4×(8–12 B) fp16 (~70 GB) won't fit; split across two Spaces (~32–40 GB each) and route across them (Phase 5.4). The build log's download progress shows the real footprint.
+- After `upload_folder` the Space rebuilds; **poll `get_space_runtime(...).stage` to `RUNNING`** (not `RUNTIME_ERROR`), then **smoke-test with a real call and inspect the output** — "RUNNING" + "no exception" can still be noise (gotcha #25).
 
 ### 7.4 Secret hygiene (never let a value touch the transcript)
 
@@ -1096,6 +1139,8 @@ Verification checklist for the runtime logs:
 | Bot replies to strangers | allowlist empty / not wired | set `ALLOWED_USER_IDS`; heed the allow-all warning |
 | Tiny quota despite PRO account | bot authenticated anonymously | inject the PRO provider token via env; verify the won auth path in logs |
 | Deploy call rejected | null title/description, or missing build fields | non-null strings; send all 7 build fields |
+| `saveEnvironment` 400 "expected nonoptional" | REST endpoint needs `buildArgs`/`buildSecrets`/`createEnvFile` too | send them present (`""`,`""`,`true`); or use `application.update` for build+swarm config |
+| New ZeroGPU Space won't take GPU / `duplicate_space` 400 | hardware not specified; fresh Space defaults to CPU | duplicate a working ZeroGPU Space with `hardware="zero-a10g"`, re-set secrets, `upload_folder` |
 | Push fails intermittently | flaky network/SSL | retry the push; it's not your code |
 
 ---
@@ -1146,6 +1191,11 @@ Every concrete trap from this build, with the root cause and the fix. Each appea
 | 22 | Backend reachability | `gradio_client` can't even **connect** to the backend Space | The Space is **PRIVATE** — without a token you cannot reach it at all (distinct from gotcha #8, where a PUBLIC space still connects anonymously at a tiny quota) | When the backend is private, the auth token is **mandatory** — make the bot config **require** it; pass `token=` to reach the Space (Phase 5 §5.1) | A private Space refused the handshake entirely until `token=` was supplied |
 | 23 | Deploy (private repo) | Dokploy can't clone a **PRIVATE** repo via `customGitUrl` | `customGitUrl` carries no credentials; a private repo needs auth to clone | Public repo → `customGitUrl` (no creds, bulletproof). Private repo → Dokploy **GitHub App** `application.saveGithubProvider` with the `githubId` from `gitProvider.getAll`; else a PAT embedded in `customGitUrl`; else make the repo public (Phase 7) | The GitHub-App path cloned bot #2's private repo where `customGitUrl` couldn't |
 | 24 | Deploy (sandbox forks) | A multi-step shell deploy dies partway through with `failed to change group ID: operation not permitted` | The execution sandbox intermittently fails subprocess forks after ~3-4 forks in a **single** Bash invocation; a deploy made of many `$(bash dokploy-api.sh …)` + python-parse `$()`s blows that budget | Run the **entire** Dokploy deploy as **one** Python process — `httpx` straight to the REST API (`x-api-key` header; `/api/project.create`, `/api/application.create`, `.saveGithubProvider`, `.saveBuildType`, `.saveEnvironment`, `.update`, `.deploy`, `/api/deployment.all`), building the env body in memory, reading injected secret files and deleting them immediately. One process = one fork = no budget issue, and secrets are never echoed (Phase 7 §7.4) | The fork error reproduced reliably after 3-4 command-substitutions in one Bash call |
+| 25 | SDXL image backend | Generation returns a **pure-noise / black** image with **no exception** | The SDXL fp16 VAE overflows and the latents decode to garbage — a *silent* failure (a 200 + a real-size PNG that's just noise) | **Bulletproof SDXL combo:** load `madebyollin/sdxl-vae-fp16-fix` (fp16) as the VAE + `EulerAncestralDiscreteScheduler` + fp16, and prefetch the VAE repo too. Don't trust "no exception" — **look at the pixels** (Phase 5) | `lustify-sdxl` returned a full-frame RGB-noise PNG on bf16+default scheduler; the VAE-fix + Euler a turned it into a clean photo |
+| 26 | SDXL scheduler | `IndexError: index N is out of bounds ... size N` **inside** the denoise loop | `DPMSolverMultistepScheduler(use_karras_sigmas=True)` indexes `self.sigmas[self.step_index + 1]` past the end on the final step on some diffusers builds; a `try/except TypeError` around the call does **not** catch it | Don't swap to DPM++ Karras blindly — use the model's default scheduler or `EulerAncestralDiscreteScheduler`. If you must guard a scheduler swap, catch `Exception`, not just `TypeError` (Phase 5) | Pulled the exact traceback from the Space run log (`scheduling_dpmsolver_multistep.py:961`) |
+| 27 | ZeroGPU Space creation | `duplicate_space` 400s: "Hardware must be specified when duplicating a Space" | ZeroGPU isn't inferred on duplicate; the hardware flavor must be named | Pass `hardware="zero-a10g"` — the ZeroGPU API flavor (HF transparently runs it on H200; `@spaces.GPU(size=…)` still picks large/xlarge). **Duplicating an existing working ZeroGPU Space is the reliable way to provision a new ZeroGPU Space** (a fresh `create_repo` Space defaults to CPU); then `upload_folder` your code over it (Phase 7) | `duplicate_space(src, dst, private=True, hardware="zero-a10g")` stamped out 3 ZeroGPU Spaces in one run |
+| 28 | LLM chat backend | Reply leaks raw chain-of-thought ("Okay, the user wants…"), or `apply_chat_template` errors on a `system` role | Qwen3 / thinking models emit a `<think>` block by default — a `<think>…</think>` regex strip fails when `max_tokens` truncates before the closing tag. Gemma's chat template rejects a `system` role outright | Suppress thinking at the source: `tokenizer.apply_chat_template(msgs, add_generation_prompt=True, enable_thinking=False)` (non-thinking templates ignore the unknown kwarg). For Gemma-family, fold the system text into the **first user message** instead of a system turn (Phase 5) | Qwen3-abliterated leaked reasoning until `enable_thinking=False`; Gemma rejected the system role |
+| 29 | Deploy (Dokploy fields) | `application.saveEnvironment` 400s: "expected nonoptional, received undefined" (`buildArgs` / `buildSecrets` / `createEnvFile`) | The REST endpoint requires those fields **present** (even empty / `true`), not just `{applicationId, env}` | Send `buildArgs:""`, `buildSecrets:""`, `createEnvFile:true` alongside the env. And `application.update` sets `buildType`+`dockerfile`+`updateConfigSwarm`(stop-first)+`replicas` in **one** call — sidestepping `saveBuildType`'s many required-nullable fields (Phase 7) | Each missing field surfaced in turn until the env saved (HTTP 200) |
 
 ---
 
