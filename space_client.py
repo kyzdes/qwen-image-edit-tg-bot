@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 
 from gradio_client import Client
 
@@ -54,6 +55,20 @@ def _looks_like_quota_error(message: str) -> bool:
     """True, если текст ошибки похож на ошибку квоты ZeroGPU."""
     low = message.lower()
     return any(marker in low for marker in _QUOTA_MARKERS)
+
+
+# ZeroGPU не смог ВЫДЕЛИТЬ слот (а не исчерпал квоту). На xlarge нужно 2 слота
+# сразу — под нагрузкой планировщик отдаёт «No GPU was available after 60s» или
+# роняет задачу («GPU task aborted»). Это ТРАНЗИЕНТНО: повтор через паузу обычно
+# ловит освободившийся слот. Проверяем ДО квоты, чтобы «task aborted» не выдавался
+# за «квота исчерпана» (его ловил маркер "gpu task").
+_GPU_UNAVAIL_MARKERS = ("no gpu", "gpu task aborted", "gpu was not available")
+
+
+def _looks_like_gpu_unavailable(message: str) -> bool:
+    """True, если ZeroGPU не выделил/уронил GPU-слот (транзиентно, ретраибельно)."""
+    low = message.lower()
+    return any(marker in low for marker in _GPU_UNAVAIL_MARKERS)
 
 
 # Парсинг точных чисел из текста ошибки квоты ZeroGPU.
@@ -212,47 +227,73 @@ class SpaceClient:
         guidance: float,
         steps: int,
     ):
-        """Вызвать predict; при ошибке соединения пересоздать клиент и повторить.
+        """Вызвать predict с ретраями и классификацией ошибки gradio:
 
-        Классифицирует исходную ошибку gradio в SpaceError/QuotaExceeded.
+          - GPU-слот не выделен / задача уронена → транзиент: пауза + повтор (до 2 раз);
+          - квота → QuotaExceeded (ретрай не помогает);
+          - сбой соединения → пересоздать клиент и повторить один раз;
+          - прочее → SpaceError.
         """
-        try:
-            client = self._get_client()
-            return self._call_predict(
-                client, image_b64, prompt, lora, seed, randomize, guidance, steps
-            )
-        except Exception as exc:  # noqa: BLE001 — нужно поймать любые ошибки gradio
-            message = str(exc) or exc.__class__.__name__
-
-            # Ошибки квоты не лечатся ретраем — сразу пробрасываем.
-            if _looks_like_quota_error(message):
-                logger.warning("Квота ZeroGPU исчерпана: %s", message)
-                rem, retry = _parse_quota_numbers(message)
-                raise QuotaExceeded(message, rem, retry) from exc
-
-            # Похоже на проблему соединения — пересоздаём клиент и пробуем ещё раз.
-            if self._is_connection_error(exc):
-                logger.warning(
-                    "Похоже на сбой соединения (%s), пересоздаю клиент и повторяю", message
+        GPU_RETRIES = 2     # доп. попытки при «No GPU available» / aborted-слоте
+        GPU_BACKOFF = 8     # пауза перед повторной постановкой в очередь, сек
+        gpu_attempt = 0
+        while True:
+            try:
+                client = self._get_client()
+                return self._call_predict(
+                    client, image_b64, prompt, lora, seed, randomize, guidance, steps
                 )
-                self._client = None
-                try:
-                    client = self._get_client()
-                    return self._call_predict(
-                        client, image_b64, prompt, lora, seed, randomize, guidance, steps
-                    )
-                except Exception as exc2:  # noqa: BLE001
-                    message2 = str(exc2) or exc2.__class__.__name__
-                    if _looks_like_quota_error(message2):
-                        logger.warning("Квота ZeroGPU исчерпана: %s", message2)
-                        rem2, retry2 = _parse_quota_numbers(message2)
-                        raise QuotaExceeded(message2, rem2, retry2) from exc2
-                    logger.error("Повторный вызов Space не удался: %s", message2)
-                    raise SpaceError(message2) from exc2
+            except Exception as exc:  # noqa: BLE001 — нужно поймать любые ошибки gradio
+                message = str(exc) or exc.__class__.__name__
 
-            # Любая прочая ошибка.
-            logger.error("Ошибка вызова Space: %s", message)
-            raise SpaceError(message) from exc
+                # ZeroGPU не выделил слот / уронил задачу — транзиентно, повторяем.
+                # Проверяем ПЕРВЫМ, чтобы «GPU task aborted» не выдавался за квоту.
+                if _looks_like_gpu_unavailable(message):
+                    if gpu_attempt < GPU_RETRIES:
+                        gpu_attempt += 1
+                        logger.warning(
+                            "ZeroGPU слот не выделен (%s) — повтор %d/%d через %dс",
+                            message, gpu_attempt, GPU_RETRIES, GPU_BACKOFF,
+                        )
+                        time.sleep(GPU_BACKOFF)
+                        continue
+                    logger.error(
+                        "ZeroGPU не выделил слот после %d попыток: %s", GPU_RETRIES + 1, message
+                    )
+                    raise SpaceError(
+                        "ZeroGPU перегружен — не удалось получить GPU-слот после %d попыток. %s"
+                        % (GPU_RETRIES + 1, message)
+                    ) from exc
+
+                # Ошибки квоты не лечатся ретраем — сразу пробрасываем.
+                if _looks_like_quota_error(message):
+                    logger.warning("Квота ZeroGPU исчерпана: %s", message)
+                    rem, retry = _parse_quota_numbers(message)
+                    raise QuotaExceeded(message, rem, retry) from exc
+
+                # Похоже на проблему соединения — пересоздаём клиент и пробуем ещё раз.
+                if self._is_connection_error(exc):
+                    logger.warning(
+                        "Похоже на сбой соединения (%s), пересоздаю клиент и повторяю", message
+                    )
+                    self._client = None
+                    try:
+                        client = self._get_client()
+                        return self._call_predict(
+                            client, image_b64, prompt, lora, seed, randomize, guidance, steps
+                        )
+                    except Exception as exc2:  # noqa: BLE001
+                        message2 = str(exc2) or exc2.__class__.__name__
+                        if _looks_like_quota_error(message2):
+                            logger.warning("Квота ZeroGPU исчерпана: %s", message2)
+                            rem2, retry2 = _parse_quota_numbers(message2)
+                            raise QuotaExceeded(message2, rem2, retry2) from exc2
+                        logger.error("Повторный вызов Space не удался: %s", message2)
+                        raise SpaceError(message2) from exc2
+
+                # Любая прочая ошибка.
+                logger.error("Ошибка вызова Space: %s", message)
+                raise SpaceError(message) from exc
 
     @staticmethod
     def _call_predict(
